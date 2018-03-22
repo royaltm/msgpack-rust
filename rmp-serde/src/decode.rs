@@ -12,7 +12,7 @@ use serde::de::{self, Deserialize, DeserializeOwned, DeserializeSeed, Visitor};
 
 use rmp;
 use rmp::Marker;
-use rmp::decode::{self, MarkerReadError, DecodeStringError, ValueReadError, NumValueReadError};
+use rmp::decode::{self, MarkerReadError, DecodeStringError, ValueReadError, NumValueReadError, ExtMeta};
 
 /// Enum representing errors that can occur while decoding MessagePack data.
 #[derive(Debug)]
@@ -39,6 +39,8 @@ pub enum Error {
     Utf8Error(Utf8Error),
     /// The depth limit was exceeded; not currently used.
     DepthLimitExceeded,
+    /// Unhandled MsgPack Ext
+    UnhandledExtension(ExtMeta),
 }
 
 impl error::Error for Error {
@@ -57,6 +59,7 @@ impl error::Error for Error {
             Error::Syntax(..) => None,
             Error::Utf8Error(ref err) => Some(err),
             Error::DepthLimitExceeded => None,
+            Error::UnhandledExtension(..) => None
         }
     }
 }
@@ -267,6 +270,18 @@ fn read_u32<R: Read>(rd: &mut R) -> Result<u32, Error> {
     rd.read_u32::<byteorder::BigEndian>().map_err(Error::InvalidDataRead)
 }
 
+pub trait VisitorExt<'de>: Visitor<'de> {
+    fn visit_ext(self, meta: ExtMeta, _v: &[u8]) -> Result<Self::Value, Error> {
+        Err(Error::UnhandledExtension(meta))
+    }
+
+    fn visit_borrowed_ext(self, meta: ExtMeta, _v: &'de [u8]) -> Result<Self::Value, Error> {
+        Err(Error::UnhandledExtension(meta))
+    }
+}
+
+impl<'de,V> VisitorExt<'de> for V where V: Visitor<'de> {}
+
 impl<'de, 'a, R: ReadSlice<'de>> serde::Deserializer<'de> for &'a mut Deserializer<R> {
     type Error = Error;
 
@@ -344,7 +359,28 @@ impl<'de, 'a, R: ReadSlice<'de>> serde::Deserializer<'de> for &'a mut Deserializ
                 self.read_bytes(len, visitor)
             }
             Marker::Reserved => Err(Error::TypeMismatch(Marker::Reserved)),
-            marker => Err(Error::TypeMismatch(marker)),
+            marker => {
+                let size = match marker {
+                    Marker::FixExt1 => 1,
+                    Marker::FixExt2 => 2,
+                    Marker::FixExt4 => 4,
+                    Marker::FixExt8 => 8,
+                    Marker::FixExt16 => 16,
+                    Marker::Ext8 => read_u8(&mut self.rd)? as u32,
+                    Marker::Ext16 => read_u16(&mut self.rd)? as u32,
+                    Marker::Ext32 => read_u32(&mut self.rd)?,
+                    marker => return Err(Error::TypeMismatch(marker)),
+                };
+                let typeid = rmp::decode::read_data_i8(&mut self.rd)?;
+                let meta = ExtMeta {
+                    typeid,
+                    size
+                };
+                match self.read_bin_data(size)? {
+                    Reference::Borrowed(buf) => VisitorExt::visit_borrowed_ext(visitor, meta, buf),
+                    Reference::Copied(buf) => VisitorExt::visit_ext(visitor, meta, buf),
+                }
+            }
         }
     }
 
